@@ -475,6 +475,14 @@ class NeighborhoodAttentionS2(BackendSelectionMixin, nn.Module):
     optimized_kernel : Optional[bool]
         Whether to use the optimized kernel (if available)
 
+    Notes
+    -----
+    Gradients taken with ``create_graph=True``, as in a gradient penalty or a Hessian-vector
+    product, are differentiable on every backend except the distributed ring, which raises. Their
+    backward runs torch ops over every (output point, neighbour) pair instead of the kernels, so it
+    needs roughly the mean neighbourhood size times the memory of the first-order backward.
+    First-order gradients still come from the kernels.
+
     References
     ----------
     :cite:`Bonev2025`
