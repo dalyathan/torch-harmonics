@@ -45,10 +45,12 @@ optimized paths.
 
 import torch
 
+from torch_harmonics._backend import _create_graph_requested
 from torch_harmonics.attention._layout import to_nchw, to_nhwc
 from torch_harmonics.utils import check
 
 from .._attention_utils import _reciprocal_or_zero, _setup_context_attention_regular_reference_backward
+from .attention_pairs_torch import _regular_attention_backward_pairs
 
 
 # =====================================================================================
@@ -513,6 +515,13 @@ def _neighborhood_s2_attention_regular_bwd_torch(ctx, grad_output):
     kw_needs_grad = ctx.needs_input_grad[0]
     vw_needs_grad = ctx.needs_input_grad[1]
     qw_needs_grad = ctx.needs_input_grad[2]
+
+    # create_graph=True: the loops below accumulate in place, which autograd cannot differentiate,
+    # so the gradients come from differentiable ops over the same neighbourhood instead
+    if _create_graph_requested():
+        rows = torch.repeat_interleave(torch.arange(row_off.numel() - 1, device=row_off.device), row_off[1:] - row_off[:-1])
+        grads = _regular_attention_backward_pairs(kw, vw, qw, grad_output, ring_weights, rows, col_idx, nh, nlon_in, nlat_out, nlon_out, ctx.needs_input_grad[:3])
+        return grads + (None,) * 7
 
     # NHWC -> channels-first with heads folded into batch (see the forward op)
     def _to_cf(t):

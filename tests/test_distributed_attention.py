@@ -796,3 +796,71 @@ class TestDistributedNeighborhoodAttention(ShardedFieldMixin, unittest.TestCase)
         gout = make_grid(grid_out, (8,) if grid_out == "healpix" else (17, 32))
         with self.assertRaises(NotImplementedError):
             thd.DistributedNeighborhoodAttentionS2(gin, gout, in_channels=4)
+
+    @parameterized.expand(
+        [
+            # grid_in, in_shape, grid_out, out_shape, dtype, optimized_kernel
+            ["healpix", (8,), "healpix", (8,), torch.float32, True],
+            ["healpix", (8,), "healpix", (4,), torch.float32, True],  # downsampling
+            ["healpix", (8,), "healpix", (8,), torch.float64, False],  # the halo reference, in float64
+        ],
+        skip_on_empty=True,
+    )
+    def test_double_backward(self, grid_in, in_shape, grid_out, out_shape, dtype, optimized_kernel, verbose=False):
+        """Second-order gradients through the halo backends equal the serial ragged reference's in float64.
+
+        The loss mixes channels with a matrix before a tanh, which keeps it local to each point,
+        so every rank's share is a partial sum of the global loss and the halo exchange carries
+        the cross-rank terms in both backward passes. The penalty is the squared norm of the
+        gradients w.r.t. q, k and v, which are disjoint shards, so it too adds up over ranks.
+        """
+        set_seed(333)
+        gin, gout = make_grid(grid_in, in_shape), make_grid(grid_out, out_shape)
+        self.skip_unless_decomposable(gin, gout)
+        args = dict(in_channels=4, grid_in=gin, grid_out=gout, num_heads=2)
+        attn_dist = thd.DistributedNeighborhoodAttentionS2(**args, optimized_kernel=optimized_kernel).to(self.device, dtype)
+        if self._refuses_device(attn_dist):
+            return
+        # the second backward has to cross ranks through the halo exchange for this to test it
+        if self.grid_size_h > 1:
+            received = torch.tensor([attn_dist.halo.recv_prev + attn_dist.halo.recv_next], device=self.device)
+            dist.all_reduce(received, group=self.h_group)
+            self.assertGreater(int(received.item()), 0, "the halo receives no rows, so nothing crosses ranks")
+        oracle = th.NeighborhoodAttentionS2(**args, optimized_kernel=False).to(self.device, torch.float64)
+        self.assertEqual(oracle.backend.name, "ragged-reference")
+        with torch.no_grad():
+            for p_dist, p_oracle in zip(attn_dist.parameters(), oracle.parameters()):
+                p_oracle.copy_(p_dist.to(torch.float64))
+
+        full = {
+            "q": torch.randn(1, 4, *gout.shape, device=self.device, dtype=torch.float64),
+            "k": torch.randn(1, 4, *gin.shape, device=self.device, dtype=torch.float64),
+            "v": torch.randn(1, 4, *gin.shape, device=self.device, dtype=torch.float64),
+        }
+        shards = {"q": attn_dist.shard_out, "k": attn_dist.shard_in, "v": attn_dist.shard_in}
+        mix = torch.randn(4, 4, device=self.device, dtype=torch.float64) / 2.0
+
+        def penalty_grads(layer, q, k, v):
+            params = list(layer.parameters())
+            out = layer(q, k, v)
+            loss = torch.tanh(torch.einsum("bc...,cd->bd...", out.to(mix.dtype), mix)).sum()
+            grads = torch.autograd.grad(loss, (q, k, v), create_graph=True)
+            return torch.autograd.grad(sum((g * g).sum() for g in grads), [q, k, v] + params)
+
+        expected = penalty_grads(oracle, *(full[n].clone().requires_grad_(True) for n in "qkv"))
+        local = {n: self.split_field(full[n], shards[n]).to(dtype).requires_grad_(True) for n in "qkv"}
+        got = penalty_grads(attn_dist, local["q"], local["k"], local["v"])
+        self._sync()
+
+        verbose = verbose and self.world_rank == 0
+        ulps, eps_dtype = (32, torch.float32) if dtype == torch.float32 else (16, torch.float64)
+        for i, n in enumerate("qkv"):
+            ok = compare_tensors(
+                f"{n} second-order grad", got[i].to(torch.float64), self.split_field(expected[i], shards[n]), atol=0.0, rtol=0.0, ulps=ulps, eps_dtype=eps_dtype, verbose=verbose
+            )
+            self.assertTrue(reduce_success(ok, self.device), f"{n}: second-order gradient differs from the serial ragged reference")
+        for (name, _), g, e in zip(attn_dist.named_parameters(), got[3:], expected[3:]):
+            ok = compare_tensors(
+                f"{name} second-order grad", self._allreduce_param_grad(g).to(torch.float64), e, atol=0.0, rtol=0.0, ulps=ulps, eps_dtype=eps_dtype, verbose=verbose
+            )
+            self.assertTrue(reduce_success(ok, self.device), f"{name}: second-order gradient differs from the serial ragged reference")

@@ -34,10 +34,13 @@ from typing import Tuple
 import torch
 from attention_helpers import optimized_kernels_is_available
 
+from torch_harmonics._backend import _create_graph_requested
 from torch_harmonics.utils import check
 
 from .. import attention_kernels
 from .._attention_utils import _setup_context_attention_ragged_backward, _setup_context_attention_regular_optimized_backward
+from ..kernels_torch.attention_pairs_torch import _arc_pairs, _attention_backward_pairs, _regular_attention_backward_pairs
+from ..kernels_torch.attention_ragged_torch import _to_channels_first, _to_channels_last
 
 # Operand checks for the fake implementations. They mirror the host-side TORCH_CHECKs in
 # attention_checks.h -- devices, dtypes, ranks, sizes -- so that under torch.compile a
@@ -430,6 +433,17 @@ def _neighborhood_s2_attention_regular_bwd_optimized(ctx, grad_output):
     nlat_out = ctx.nlat_out
     nlon_out = ctx.nlon_out
 
+    # create_graph=True: the same gradients from differentiable ops, over the pairs of the saved arcs.
+    # An upsampling pattern is stored per input ring over output columns, see _regular_pairs.
+    if _create_graph_requested():
+        nlat_in = kw.shape[1]
+        upsample = nlon_in % nlon_out != 0
+        nrings, nlon_cols = (nlat_out, nlon_out) if upsample else (nlat_in, nlon_in)
+        ring_base = torch.arange(nrings, device=seg.device) * nlon_cols
+        rows, cols, _ = _arc_pairs(seg, seg_off, ring_base, torch.full_like(ring_base, nlon_cols))
+        grads = _regular_attention_backward_pairs(kw, vw, qw, grad_output, ring_weights, rows, cols, nh, nlon_in, nlat_out, nlon_out, ctx.needs_input_grad[:3])
+        return grads + (None,) * 7
+
     # NHWC throughout, heads packed along channels -- no folding, see the forward.
     # The CUDA backward accumulates gradients in fp32 internally and casts back at
     # the op boundary.
@@ -624,6 +638,15 @@ def _neighborhood_s2_attention_ragged_bwd_optimized(ctx, grad_output, grad_y_hi,
     psi_seg, psi_seg_off, ring_base, ring_size, ring_weights, kw, vw, qw, y, y_hi, alpha_sum, qdotk_max = ctx.saved_tensors
     nh = ctx.nh
     npoints_out = ctx.npoints_out
+
+    # create_graph=True: the same gradients from differentiable ops, over the pairs of the saved arcs
+    if _create_graph_requested():
+        out_idx, in_idx, ring = _arc_pairs(psi_seg, psi_seg_off, ring_base, ring_size)
+        compute_dtype = torch.promote_types(kw.dtype, torch.float32)
+        kx, vx, qy, dy = (_to_channels_first(t, nh).to(compute_dtype) for t in (kw, vw, qw, grad_output))
+        dkx, dvx, dqy = _attention_backward_pairs(kx, vx, qy, dy, ring_weights[ring], out_idx, in_idx, ctx.needs_input_grad[:3])
+        grads = tuple(None if g is None else _to_channels_last(g, nh).to(t.dtype) for g, t in zip((dkx, dvx, dqy), (kw, vw, qw)))
+        return grads + (None,) * 7
 
     kw = kw.contiguous()
     vw = vw.contiguous()

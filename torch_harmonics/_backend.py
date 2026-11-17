@@ -92,6 +92,18 @@ def _reference_state_dtype(layer) -> torch.dtype:
     return torch.float64 if layer.dtype == torch.float64 else torch.float32
 
 
+def _create_graph_requested() -> bool:
+    """
+    Whether the backward running now must itself be differentiable.
+
+    Autograd runs a backward with grad mode on exactly under ``create_graph=True``, so a backward
+    built from kernels autograd cannot see has to switch to differentiable ops, or refuse. Eager
+    only: a compiled backward rejects ``create_graph`` by itself, and the compiled graphs keep the
+    kernel path.
+    """
+    return torch.is_grad_enabled() and not torch.compiler.is_compiling()
+
+
 class BackendS2:
     """
     One way of evaluating a layer, and the state it needs to do it.

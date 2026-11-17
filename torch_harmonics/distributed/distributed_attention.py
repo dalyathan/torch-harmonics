@@ -35,7 +35,7 @@ import torch
 import torch.distributed as dist
 from attention_helpers import optimized_kernels_is_available
 
-from torch_harmonics._backend import _kernel_device_types
+from torch_harmonics._backend import _create_graph_requested, _kernel_device_types
 from torch_harmonics.attention import attention_kernels
 from torch_harmonics.attention._attention_utils import _reciprocal_or_zero
 from torch_harmonics.attention.attention import NeighborhoodAttentionS2
@@ -162,9 +162,9 @@ def _stat_per_head(stat: torch.Tensor) -> torch.Tensor:
 
 def _refuse_double_backward():
     """Raise under ``create_graph=True``: the ring backward runs attention kernels that autograd cannot differentiate."""
-    if torch.is_grad_enabled() and not torch.compiler.is_compiling():
+    if _create_graph_requested():
         raise RuntimeError(
-            "DistributedNeighborhoodAttentionS2 does not support double backward (create_graph=True): its backward runs the ring attention kernels, "
+            "The ring backend of DistributedNeighborhoodAttentionS2 does not support double backward (create_graph=True): its backward runs the ring attention kernels, "
             "whose own gradients autograd cannot compute."
         )
 

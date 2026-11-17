@@ -46,6 +46,7 @@ from disco_helpers import (
     optimized_kernels_is_available,
 )
 
+from torch_harmonics._backend import _create_graph_requested
 from torch_harmonics.utils import check
 
 from .. import disco_kernels
@@ -707,7 +708,7 @@ class _DiscoConvFn(torch.autograd.Function):
 
         # create_graph=True: the gradients must be differentiable themselves. Eager only, a
         # compiled backward rejects create_graph by itself.
-        if torch.is_grad_enabled() and not torch.compiler.is_compiling():
+        if _create_graph_requested():
             arcs = (row_ker, row_lat, seg_off, seg, val_off, vals)
             return _conv_backward_differentiable(ctx, grad_output_r, inp, weight, arcs) + nones
 
@@ -886,7 +887,7 @@ class _DiscoRaggedConvFn(torch.autograd.Function):
 
         # create_graph=True: the gradients must be differentiable themselves. Eager only, a
         # compiled backward rejects create_graph by itself.
-        if torch.is_grad_enabled() and not torch.compiler.is_compiling():
+        if _create_graph_requested():
             arcs = (row_ker, row_pt, seg_off, seg, val_off, vals, ring_base, ring_size)
             return _ragged_conv_backward_differentiable(ctx, grad_output_r, inp, weight, arcs) + nones
 
