@@ -3114,6 +3114,8 @@ _DOUBLE_BACKWARD_GRIDS = [
 _DOUBLE_BACKWARD_ULPS = 32
 _DOUBLE_BACKWARD_F64_ULPS = 64
 _DOUBLE_BACKWARD_AMP_ULPS = 16
+# with QK norm the normalization makes float32 less well conditioned (measured: 20.3)
+_DOUBLE_BACKWARD_QKNORM_ULPS = 64
 
 
 @contextlib.contextmanager
@@ -3174,7 +3176,8 @@ class TestNeighborhoodAttentionDoubleBackward(unittest.TestCase):
 
     def _layers(self, grid_in, grid_out, optimized_kernel, dtype, **layer_kwargs):
         """The layer under test and its float64 ragged-reference twin with identical parameters."""
-        kwargs = dict(in_channels=4, num_heads=2, use_qknorm=False, **layer_kwargs)
+        kwargs = dict(in_channels=4, num_heads=2, use_qknorm=False)
+        kwargs.update(layer_kwargs)
         layer = NeighborhoodAttentionS2(grid_in=grid_in, grid_out=grid_out, optimized_kernel=optimized_kernel, **kwargs).to(self.device, dtype)
         oracle = NeighborhoodAttentionS2(grid_in=_as_ragged(grid_in), grid_out=_as_ragged(grid_out), optimized_kernel=False, **kwargs).to(self.device, torch.float64)
         oracle.load_state_dict({name: p.to(torch.float64) for name, p in layer.state_dict().items()})
@@ -3192,11 +3195,11 @@ class TestNeighborhoodAttentionDoubleBackward(unittest.TestCase):
         penalty = sum((g * g).sum() for g in grads)
         return torch.autograd.grad(penalty, inputs)
 
-    def _inputs(self, layer, grid_in, grid_out, dtype):
+    def _inputs(self, layer, grid_in, grid_out, dtype, channels=4):
         """q on the output grid and k, v on the input grid, shaped as the layer expects."""
-        q = torch.randn(1, 4, *grid_out.shape, device=self.device, dtype=dtype)
-        k = torch.randn(1, 4, *grid_in.shape, device=self.device, dtype=dtype)
-        v = torch.randn(1, 4, *grid_in.shape, device=self.device, dtype=dtype)
+        q = torch.randn(1, channels, *grid_out.shape, device=self.device, dtype=dtype)
+        k = torch.randn(1, channels, *grid_in.shape, device=self.device, dtype=dtype)
+        v = torch.randn(1, channels, *grid_in.shape, device=self.device, dtype=dtype)
         n = math.prod(grid_out.shape)
         mix = torch.randn(n, n, device=self.device, dtype=torch.float64) / n**0.5
         return q, k, v, mix
@@ -3358,3 +3361,20 @@ class TestNeighborhoodAttentionDoubleBackward(unittest.TestCase):
         for n, c, e in zip("qkv", compiled, eager):
             with self.subTest(gradient=n):
                 self.assertTrue(compare_tensors(f"{n} grad", c, e, atol=0.0, rtol=0.0, ulps=16, verbose=verbose))
+
+    @parameterized.expand([[name, gi, go] for name, gi, go in _DOUBLE_BACKWARD_GRIDS if name in ("same", "upsample", "healpix")], skip_on_empty=True)
+    def test_second_order_with_qknorm(self, name, grid_in, grid_out, verbose=False):
+        """Second-order gradients with QK norm equal the ragged reference's; 8 channels per head keep float32 well conditioned."""
+        if not optimized_kernels_is_available():
+            raise unittest.SkipTest("optimized kernels are not available")
+        grid_in, grid_out = grid_in(), grid_out()
+        layer, oracle = self._layers(grid_in, grid_out, True, torch.float32, in_channels=16, use_qknorm=True)
+        q, k, v, mix = self._inputs(layer, grid_in, grid_out, torch.float32, channels=16)
+
+        got = self._penalty_grads(layer, *(t.clone().requires_grad_(True) for t in (q, k, v)), mix)
+        expected = self._oracle_grads(oracle, q, k, v, mix)
+
+        names = ["q", "k", "v"] + [n for n, _ in layer.named_parameters()]
+        for n, g, e in zip(names, got, expected):
+            with self.subTest(gradient=n):
+                self._check(n, g, e, _DOUBLE_BACKWARD_QKNORM_ULPS, verbose)

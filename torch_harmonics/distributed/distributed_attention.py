@@ -164,7 +164,7 @@ def _refuse_double_backward():
     """Raise under ``create_graph=True``: the ring backward runs attention kernels that autograd cannot differentiate."""
     if _create_graph_requested():
         raise RuntimeError(
-            "DistributedNeighborhoodAttentionS2 does not support double backward (create_graph=True): its backward runs the ring attention kernels, "
+            "The ring backend of DistributedNeighborhoodAttentionS2 does not support double backward (create_graph=True): its backward runs the ring attention kernels, "
             "whose own gradients autograd cannot compute."
         )
 

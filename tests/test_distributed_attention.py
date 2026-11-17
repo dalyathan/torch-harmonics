@@ -821,6 +821,11 @@ class TestDistributedNeighborhoodAttention(ShardedFieldMixin, unittest.TestCase)
         attn_dist = thd.DistributedNeighborhoodAttentionS2(**args, optimized_kernel=optimized_kernel).to(self.device, dtype)
         if self._refuses_device(attn_dist):
             return
+        # the second backward has to cross ranks through the halo exchange for this to test it
+        if self.grid_size_h > 1:
+            received = torch.tensor([attn_dist.halo.recv_prev + attn_dist.halo.recv_next], device=self.device)
+            dist.all_reduce(received, group=self.h_group)
+            self.assertGreater(int(received.item()), 0, "the halo receives no rows, so nothing crosses ranks")
         oracle = th.NeighborhoodAttentionS2(**args, optimized_kernel=False).to(self.device, torch.float64)
         self.assertEqual(oracle.backend.name, "ragged-reference")
         with torch.no_grad():
